@@ -17,7 +17,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.*
-import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.activity.compose.rememberLauncherForActivityResult
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import com.rohan.livedash.data.Session
