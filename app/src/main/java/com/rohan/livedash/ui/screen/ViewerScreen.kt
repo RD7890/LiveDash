@@ -1,12 +1,8 @@
 package com.rohan.livedash.ui.screen
 
 import android.content.Intent
-import android.graphics.SurfaceTexture
-import android.media.MediaCodec
-import android.media.MediaFormat
+import android.graphics.BitmapFactory
 import android.util.Log
-import android.view.Surface
-import android.view.TextureView
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
@@ -19,11 +15,11 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.*
 import androidx.compose.ui.draw.*
 import androidx.compose.ui.graphics.*
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.*
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.rohan.livedash.data.Message
 import com.rohan.livedash.data.MessageType
@@ -246,84 +242,56 @@ private fun PairTab(serverRunning: Boolean, localIp: String, qrContent: String?)
     }
 }
 
-// ── MediaCodec decoder ─────────────────────────────────────────────────────────
-
-private class DecoderHolder {
-    @Volatile private var codec: MediaCodec? = null
-    @Volatile private var started = false
-
-    fun init(outputSurface: Surface) {
-        release()
-        try {
-            val dec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 1920, 1080)
-            dec.configure(fmt, outputSurface, null, 0)
-            dec.start(); codec = dec; started = true
-        } catch (e: Exception) { Log.e("DecoderHolder", "Init error", e) }
-    }
-
-    fun feed(data: ByteArray, flags: Int) {
-        val dec = codec ?: return; if (!started) return
-        try {
-            val idx = dec.dequeueInputBuffer(8_000)
-            if (idx >= 0) {
-                val buf = dec.getInputBuffer(idx)!!
-                buf.clear(); buf.put(data)
-                dec.queueInputBuffer(idx, 0, data.size, System.nanoTime() / 1000, flags)
-            }
-            val info = MediaCodec.BufferInfo()
-            var out = dec.dequeueOutputBuffer(info, 0)
-            while (out >= 0) { dec.releaseOutputBuffer(out, true); out = dec.dequeueOutputBuffer(info, 0) }
-        } catch (e: Exception) { Log.e("DecoderHolder", "Feed error", e) }
-    }
-
-    fun release() {
-        started = false
-        try { codec?.stop() } catch (_: Exception) {}
-        try { codec?.release() } catch (_: Exception) {}
-        codec = null
-    }
-}
+// ── JPEG frame player ──────────────────────────────────────────────────────────
+// Sender streams JPEG frames (base64-encoded) via the video_frame message.
+// We decode each frame with BitmapFactory — no codec setup, works on every device.
 
 @Composable
 private fun LiveVideoPlayer(senderId: String, modifier: Modifier = Modifier) {
     val frameFlow: SharedFlow<VideoChunk> = remember(senderId) {
         DashboardState.getOrCreateVideoStream(senderId) as SharedFlow<VideoChunk>
     }
-    val decoderHolder = remember(senderId) { DecoderHolder() }
-    var surfaceReady by remember { mutableStateOf(false) }
+    var bitmap by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
 
-    DisposableEffect(senderId) { onDispose { decoderHolder.release() } }
+    DisposableEffect(senderId) {
+        onDispose { bitmap?.recycle(); bitmap = null }
+    }
 
-    Box(modifier, contentAlignment = Alignment.Center) {
-        AndroidView(
-            factory = { ctx ->
-                TextureView(ctx).apply {
-                    surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-                        override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
-                            decoderHolder.init(Surface(st)); surfaceReady = true
-                        }
-                        override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
-                        override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
-                            surfaceReady = false; decoderHolder.release(); return true
-                        }
-                        override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+    LaunchedEffect(senderId) {
+        withContext(Dispatchers.IO) {
+            frameFlow.collect { chunk ->
+                try {
+                    val bmp = BitmapFactory.decodeByteArray(chunk.data, 0, chunk.data.size)
+                    if (bmp != null) {
+                        val old = bitmap
+                        bitmap = bmp
+                        old?.recycle()
                     }
+                } catch (e: Exception) {
+                    Log.e("LiveVideoPlayer", "JPEG decode error", e)
                 }
-            },
-            modifier = Modifier.fillMaxSize()
-        )
-        if (!surfaceReady) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                CircularProgressIndicator(color = Accent, modifier = Modifier.size(28.dp))
-                Text("Connecting", style = MaterialTheme.typography.bodySmall, color = TextMuted)
             }
         }
     }
 
-    LaunchedEffect(senderId, surfaceReady) {
-        if (!surfaceReady) return@LaunchedEffect
-        withContext(Dispatchers.IO) { frameFlow.collect { decoderHolder.feed(it.data, it.flags) } }
+    Box(modifier, contentAlignment = Alignment.Center) {
+        val bmp = bitmap
+        if (bmp != null) {
+            Image(
+                bitmap = bmp.asImageBitmap(),
+                contentDescription = "Live feed",
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Fit
+            )
+        } else {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                CircularProgressIndicator(color = Accent, modifier = Modifier.size(28.dp))
+                Text("Waiting for feed…", style = MaterialTheme.typography.bodySmall, color = TextMuted)
+            }
+        }
     }
 }
 
