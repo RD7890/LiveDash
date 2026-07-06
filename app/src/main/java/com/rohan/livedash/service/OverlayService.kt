@@ -13,9 +13,6 @@ import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
-import android.media.MediaCodec
-import android.media.MediaCodecInfo
-import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Handler
@@ -26,8 +23,6 @@ import android.util.Base64
 import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
-import android.view.Surface
-import android.view.View
 import android.view.WindowManager
 import android.view.WindowManager.LayoutParams
 import android.view.inputmethod.InputMethodManager
@@ -46,6 +41,8 @@ import com.rohan.livedash.data.Message
 import com.rohan.livedash.data.MessageType
 import com.rohan.livedash.network.SenderClient
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
@@ -68,16 +65,17 @@ class OverlayService : LifecycleService() {
     private var windowManager: WindowManager? = null
     private var overlayRoot: FrameLayout? = null
     private var overlayParams: LayoutParams? = null
-    private var chatPanel: View? = null
+    private var chatPanel: android.view.View? = null
     private var chatPanelParams: LayoutParams? = null
     private var chatPanelVisible = false
     private var chatMsgContainer: LinearLayout? = null
     private var chatScrollView: ScrollView? = null
+    private var savedOverlayY = -1
 
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
-    private var videoEncoder: MediaCodec? = null
-    private var encoderSurface: Surface? = null
+    private var imageReader: ImageReader? = null
+    private var streamingJob: Job? = null
     private var client: SenderClient? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
@@ -132,9 +130,7 @@ class OverlayService : LifecycleService() {
         val c = SenderClient(
             serverIp = ip, port = port, senderName = name,
             onConnected = { _ -> OverlayState.connected.value = true },
-            onDisconnected = {
-                OverlayState.connected.value = false
-            },
+            onDisconnected = { OverlayState.connected.value = false },
             onChatReceived = { text, msgId, replyTo ->
                 OverlayState.addMessage(
                     Message(msgId, MessageType.TEXT, text, null,
@@ -142,13 +138,13 @@ class OverlayService : LifecycleService() {
                 )
             },
             onError = { errMsg ->
-                showToast("Connection error: $errMsg")
+                showToast("Connection error — check the Viewer IP and make sure the server is running.\n($errMsg)")
             }
         )
         try {
             c.connect()
         } catch (e: Exception) {
-            showToast("Could not reach ${ip}:${port} — ${e.message?.take(80)}")
+            showToast("Could not connect to $ip:$port — ${e.message?.take(80)}")
         }
         client = c
         OverlayState.client = c
@@ -158,8 +154,7 @@ class OverlayService : LifecycleService() {
         val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         val mp = mgr.getMediaProjection(resultCode, data)
         val metrics = resources.displayMetrics
-        val sw = metrics.widthPixels
-        val sh = metrics.heightPixels
+        val sw = metrics.widthPixels; val sh = metrics.heightPixels
         dpi = metrics.densityDpi
 
         targetW = (if (sw > 1280) 1280 else sw).let { if (it % 2 != 0) it - 1 else it }
@@ -172,98 +167,60 @@ class OverlayService : LifecycleService() {
             }
         }, Handler(Looper.getMainLooper()))
 
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, targetW, targetH).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, 2_000_000)
-            setInteger(MediaFormat.KEY_FRAME_RATE, 15)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
-        }
-
-        val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        enc.setCallback(object : MediaCodec.Callback() {
-            override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {}
-            override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {}
-            override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
-                Log.e("OverlayService", "Encoder error", e)
-            }
-            override fun onOutputBufferAvailable(codec: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
-                if (info.size > 0) {
-                    try {
-                        val buffer = codec.getOutputBuffer(index)
-                        if (buffer != null) {
-                            val bytes = ByteArray(info.size)
-                            buffer.position(info.offset); buffer.limit(info.offset + info.size); buffer.get(bytes)
-                            val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
-                            client?.sendVideoFrame(b64, info.flags)
-                        }
-                    } catch (e: Exception) { Log.e("OverlayService", "Frame error", e) }
-                }
-                codec.releaseOutputBuffer(index, false)
-            }
-        })
-        enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        val surface = enc.createInputSurface()
-        enc.start()
-        videoEncoder = enc
-        encoderSurface = surface
+        // Single ImageReader VirtualDisplay — used for both live streaming and screenshots.
+        // This avoids the Android 14+ restriction of only one createVirtualDisplay per projection.
+        val reader = ImageReader.newInstance(targetW, targetH, PixelFormat.RGBA_8888, 3)
+        imageReader = reader
 
         virtualDisplay = mp.createVirtualDisplay(
             "LiveDashCapture", targetW, targetH, dpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, surface, null, null
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.surface, null, null
         )
         mediaProjection = mp
+
+        // Continuous JPEG streaming at ~8fps — low enough for shared WiFi, still smooth to view.
+        streamingJob = lifecycleScope.launch(Dispatchers.IO) {
+            while (true) {
+                delay(125L)
+                sendLatestJpeg(quality = 35, asScreenshot = false)
+            }
+        }
     }
 
     private fun captureScreenshot() {
-        // Android 14+ forbids calling createVirtualDisplay twice on the same MediaProjection.
-        // Instead we temporarily swap the existing VirtualDisplay's surface to an ImageReader,
-        // capture one frame, then restore the encoder surface.
-        val vd = virtualDisplay ?: run {
-            showToast("Screenshot unavailable — screen capture not active")
+        if (imageReader == null) {
+            showToast("Screenshot unavailable — screen capture is not active")
             return
         }
-        val enc = encoderSurface ?: run {
-            showToast("Screenshot unavailable — encoder not ready")
-            return
+        lifecycleScope.launch(Dispatchers.IO) {
+            val ok = sendLatestJpeg(quality = 88, asScreenshot = true)
+            if (!ok) showToast("No frame captured yet — wait a moment and try again")
         }
-        val w = targetW; val h = targetH
-        val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
-        try {
-            vd.setSurface(reader.surface)
+    }
+
+    private suspend fun sendLatestJpeg(quality: Int, asScreenshot: Boolean): Boolean {
+        return try {
+            val image = imageReader?.acquireLatestImage() ?: return false
+            val planes = image.planes
+            val buffer = planes[0].buffer
+            val rowStride = planes[0].rowStride
+            val pixelStride = planes[0].pixelStride
+            val w = image.width; val h = image.height
+            val bmp = Bitmap.createBitmap(rowStride / pixelStride, h, Bitmap.Config.ARGB_8888)
+            bmp.copyPixelsFromBuffer(buffer)
+            image.close()
+            val cropped = if (bmp.width > w) Bitmap.createBitmap(bmp, 0, 0, w, h) else bmp
+            val baos = ByteArrayOutputStream()
+            cropped.compress(Bitmap.CompressFormat.JPEG, quality, baos)
+            val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+            if (cropped !== bmp) cropped.recycle()
+            bmp.recycle()
+            if (asScreenshot) client?.sendScreenshot(b64) else client?.sendVideoFrame(b64, 0)
+            true
         } catch (e: Exception) {
-            showToast("Screenshot failed: ${e.message?.take(80)}")
-            reader.close()
-            return
+            Log.e("OverlayService", "JPEG capture error", e)
+            false
         }
-        Handler(Looper.getMainLooper()).postDelayed({
-            try {
-                val image = reader.acquireLatestImage()
-                if (image != null) {
-                    val planes = image.planes
-                    val buffer = planes[0].buffer
-                    val rowStride = planes[0].rowStride
-                    val pixelStride = planes[0].pixelStride
-                    val bmp = Bitmap.createBitmap(rowStride / pixelStride, h, Bitmap.Config.ARGB_8888)
-                    bmp.copyPixelsFromBuffer(buffer)
-                    val cropped = if (bmp.width > w) Bitmap.createBitmap(bmp, 0, 0, w, h) else bmp
-                    val baos = ByteArrayOutputStream()
-                    cropped.compress(Bitmap.CompressFormat.JPEG, 85, baos)
-                    val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
-                    client?.sendScreenshot(b64)
-                    image.close()
-                    if (cropped !== bmp) cropped.recycle()
-                    bmp.recycle()
-                } else {
-                    showToast("No frame captured — try again in a second")
-                }
-            } catch (e: Exception) {
-                Log.e("OverlayService", "Screenshot error", e)
-                showToast("Screenshot failed: ${e.message?.take(80)}")
-            } finally {
-                try { vd.setSurface(enc) } catch (_: Exception) {}
-                reader.close()
-            }
-        }, 300)
     }
 
     private fun showToast(msg: String) {
@@ -284,13 +241,12 @@ class OverlayService : LifecycleService() {
         ).apply {
             gravity = Gravity.TOP or Gravity.START
             x = resources.displayMetrics.widthPixels - 180
-            y = resources.displayMetrics.heightPixels / 2
+            y = resources.displayMetrics.heightPixels / 4
         }
         overlayParams = params
 
-        // Anonymous FrameLayout that intercepts drag touches before child buttons consume them.
-        // onInterceptTouchEvent returns false for taps (so buttons still click) but true once a
-        // drag is detected, so the overlay moves without cancelling the button press falsely.
+        // Anonymous FrameLayout: intercepts drags in onInterceptTouchEvent (so buttons still click),
+        // then continues tracking position in onTouchEvent for subsequent MOVE events.
         val root = object : FrameLayout(this@OverlayService) {
             private var dX = 0f; private var dY = 0f
             private var iX = 0; private var iY = 0
@@ -315,14 +271,24 @@ class OverlayService : LifecycleService() {
                             return true
                         }
                     }
-                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                        isDragging = false
-                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> isDragging = false
                 }
                 return false
             }
 
-            override fun onTouchEvent(ev: MotionEvent): Boolean = isDragging
+            // After interception, MOVE events come here — must keep updating position.
+            override fun onTouchEvent(ev: MotionEvent): Boolean {
+                if (!isDragging) return false
+                when (ev.action) {
+                    MotionEvent.ACTION_MOVE -> {
+                        params.x = (iX + ev.rawX - dX).toInt()
+                        params.y = (iY + ev.rawY - dY).toInt()
+                        try { wm.updateViewLayout(this, params) } catch (_: Exception) {}
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> isDragging = false
+                }
+                return true
+            }
         }
         overlayRoot = root
 
@@ -332,7 +298,6 @@ class OverlayService : LifecycleService() {
         }
 
         val accentColor = Color.parseColor("#FF2541")
-
         val fabCamera = makeIconBtn(android.R.drawable.ic_menu_camera, accentColor) { captureScreenshot() }
         val fabChat = makeIconBtn(android.R.drawable.ic_dialog_email, Color.parseColor("#CC22C55E")) { toggleChatPanel() }
         val fabStop = makeIconBtn(android.R.drawable.ic_delete, Color.parseColor("#CC6868A0")) {
@@ -373,7 +338,14 @@ class OverlayService : LifecycleService() {
         val wm = windowManager ?: return
         val metrics = resources.displayMetrics
         val panelW = (metrics.widthPixels * 0.88).toInt()
-        val panelH = (metrics.heightPixels * 0.42).toInt()
+        val panelH = (metrics.heightPixels * 0.38).toInt()
+
+        // Move button overlay to top-right so chat panel doesn't hide it
+        overlayParams?.let { p ->
+            savedOverlayY = p.y
+            p.y = 80
+            try { wm.updateViewLayout(overlayRoot, p) } catch (_: Exception) {}
+        }
 
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -429,7 +401,12 @@ class OverlayService : LifecycleService() {
             LayoutParams.TYPE_APPLICATION_OVERLAY,
             LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL; y = 200 }
+        ).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            y = 0
+            // Pan the panel above the keyboard when the EditText is focused
+            softInputMode = LayoutParams.SOFT_INPUT_ADJUST_PAN or LayoutParams.SOFT_INPUT_STATE_VISIBLE
+        }
         chatPanelParams = pp
 
         refreshChatPanel(OverlayState.messages.value)
@@ -440,10 +417,17 @@ class OverlayService : LifecycleService() {
         Handler(Looper.getMainLooper()).postDelayed({
             val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
             imm.showSoftInput(editText, InputMethodManager.SHOW_IMPLICIT)
-        }, 100)
+        }, 120)
     }
 
     private fun hideChatPanel() {
+        // Restore button overlay to its pre-chat position
+        overlayParams?.let { p ->
+            if (savedOverlayY >= 0) {
+                p.y = savedOverlayY
+                try { windowManager?.updateViewLayout(overlayRoot, p) } catch (_: Exception) {}
+            }
+        }
         try { windowManager?.removeView(chatPanel) } catch (_: Exception) {}
         chatPanelVisible = false; chatPanel = null; chatMsgContainer = null; chatScrollView = null
     }
@@ -465,16 +449,14 @@ class OverlayService : LifecycleService() {
     }
 
     private fun cleanup() {
+        streamingJob?.cancel(); streamingJob = null
         hideChatPanel()
         try { windowManager?.removeView(overlayRoot) } catch (_: Exception) {}
         try { virtualDisplay?.release() } catch (_: Exception) {}
-        try { videoEncoder?.signalEndOfInputStream() } catch (_: Exception) {}
-        try { videoEncoder?.stop() } catch (_: Exception) {}
-        try { videoEncoder?.release() } catch (_: Exception) {}
-        try { encoderSurface?.release() } catch (_: Exception) {}
+        try { imageReader?.close() } catch (_: Exception) {}
+        imageReader = null
         try { mediaProjection?.stop() } catch (_: Exception) {}
         try { client?.stopReconnect(); client?.close() } catch (_: Exception) {}
-        videoEncoder = null; encoderSurface = null
         OverlayState.reset()
     }
 
