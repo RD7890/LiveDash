@@ -38,6 +38,7 @@ import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import com.rohan.livedash.MainActivity
@@ -131,15 +132,24 @@ class OverlayService : LifecycleService() {
         val c = SenderClient(
             serverIp = ip, port = port, senderName = name,
             onConnected = { _ -> OverlayState.connected.value = true },
-            onDisconnected = { OverlayState.connected.value = false },
+            onDisconnected = {
+                OverlayState.connected.value = false
+            },
             onChatReceived = { text, msgId, replyTo ->
                 OverlayState.addMessage(
                     Message(msgId, MessageType.TEXT, text, null,
                         System.currentTimeMillis(), "", "Dashboard", false, replyTo)
                 )
+            },
+            onError = { errMsg ->
+                showToast("Connection error: $errMsg")
             }
         )
-        c.connect()
+        try {
+            c.connect()
+        } catch (e: Exception) {
+            showToast("Could not reach ${ip}:${port} — ${e.message?.take(80)}")
+        }
         client = c
         OverlayState.client = c
     }
@@ -205,13 +215,26 @@ class OverlayService : LifecycleService() {
     }
 
     private fun captureScreenshot() {
-        val mp = mediaProjection ?: return
-        val w = targetW; val h = targetH; val d = dpi
-        val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 1)
-        val ssDisplay = mp.createVirtualDisplay(
-            "LiveDashScreenshot", w, h, d,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.surface, null, null
-        )
+        // Android 14+ forbids calling createVirtualDisplay twice on the same MediaProjection.
+        // Instead we temporarily swap the existing VirtualDisplay's surface to an ImageReader,
+        // capture one frame, then restore the encoder surface.
+        val vd = virtualDisplay ?: run {
+            showToast("Screenshot unavailable — screen capture not active")
+            return
+        }
+        val enc = encoderSurface ?: run {
+            showToast("Screenshot unavailable — encoder not ready")
+            return
+        }
+        val w = targetW; val h = targetH
+        val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+        try {
+            vd.setSurface(reader.surface)
+        } catch (e: Exception) {
+            showToast("Screenshot failed: ${e.message?.take(80)}")
+            reader.close()
+            return
+        }
         Handler(Looper.getMainLooper()).postDelayed({
             try {
                 val image = reader.acquireLatestImage()
@@ -230,22 +253,28 @@ class OverlayService : LifecycleService() {
                     image.close()
                     if (cropped !== bmp) cropped.recycle()
                     bmp.recycle()
+                } else {
+                    showToast("No frame captured — try again in a second")
                 }
             } catch (e: Exception) {
                 Log.e("OverlayService", "Screenshot error", e)
+                showToast("Screenshot failed: ${e.message?.take(80)}")
             } finally {
-                ssDisplay?.release()
+                try { vd.setSurface(enc) } catch (_: Exception) {}
                 reader.close()
             }
-        }, 250)
+        }, 300)
+    }
+
+    private fun showToast(msg: String) {
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(this@OverlayService, msg, Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun showOverlay() {
         val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         windowManager = wm
-
-        val root = FrameLayout(this)
-        overlayRoot = root
 
         val params = LayoutParams(
             LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT,
@@ -259,14 +288,50 @@ class OverlayService : LifecycleService() {
         }
         overlayParams = params
 
-        // Bubble button
+        // Anonymous FrameLayout that intercepts drag touches before child buttons consume them.
+        // onInterceptTouchEvent returns false for taps (so buttons still click) but true once a
+        // drag is detected, so the overlay moves without cancelling the button press falsely.
+        val root = object : FrameLayout(this@OverlayService) {
+            private var dX = 0f; private var dY = 0f
+            private var iX = 0; private var iY = 0
+            private var isDragging = false
+
+            override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+                when (ev.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        dX = ev.rawX; dY = ev.rawY
+                        iX = params.x; iY = params.y
+                        isDragging = false
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        val ddx = ev.rawX - dX; val ddy = ev.rawY - dY
+                        if (!isDragging && (Math.abs(ddx) > 8f || Math.abs(ddy) > 8f)) {
+                            isDragging = true
+                        }
+                        if (isDragging) {
+                            params.x = (iX + ddx).toInt()
+                            params.y = (iY + ddy).toInt()
+                            try { wm.updateViewLayout(this, params) } catch (_: Exception) {}
+                            return true
+                        }
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        isDragging = false
+                    }
+                }
+                return false
+            }
+
+            override fun onTouchEvent(ev: MotionEvent): Boolean = isDragging
+        }
+        overlayRoot = root
+
         val bubble = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(4, 4, 4, 4)
         }
 
         val accentColor = Color.parseColor("#FF2541")
-        val surfaceColor = Color.parseColor("#CC1A1A24")
 
         val fabCamera = makeIconBtn(android.R.drawable.ic_menu_camera, accentColor) { captureScreenshot() }
         val fabChat = makeIconBtn(android.R.drawable.ic_dialog_email, Color.parseColor("#CC22C55E")) { toggleChatPanel() }
@@ -280,26 +345,6 @@ class OverlayService : LifecycleService() {
         root.addView(bubble, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT
         ))
-
-        var downX = 0f; var downY = 0f; var initX = 0; var initY = 0; var dragging = false
-        root.setOnTouchListener { _, event ->
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    downX = event.rawX; downY = event.rawY
-                    initX = params.x; initY = params.y; dragging = false; true
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    val dx = event.rawX - downX; val dy = event.rawY - downY
-                    if (dragging || (Math.abs(dx) > 10 || Math.abs(dy) > 10)) {
-                        dragging = true
-                        params.x = initX + dx.toInt(); params.y = initY + dy.toInt()
-                        try { wm.updateViewLayout(root, params) } catch (_: Exception) {}
-                    }
-                    true
-                }
-                else -> false
-            }
-        }
 
         wm.addView(root, params)
     }
