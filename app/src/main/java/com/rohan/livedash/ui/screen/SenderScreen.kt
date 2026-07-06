@@ -34,7 +34,7 @@ import com.rohan.livedash.viewmodel.AppViewModel
 import java.text.SimpleDateFormat
 import java.util.*
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun SenderScreen(
     vm: AppViewModel = viewModel(),
@@ -325,6 +325,3 @@ private fun ldColors() = OutlinedTextFieldDefaults.colors(
     cursorColor = Accent, focusedTextColor = TextPrimary, unfocusedTextColor = TextPrimary
 )
 
-@OptIn(ExperimentalFoundationApi::class)
-private fun Modifier.combinedClickable(onClick: () -> Unit, onLongClick: () -> Unit) =
-    this.combinedClickable(onClick = onClick, onLongClick = onLongClick)
