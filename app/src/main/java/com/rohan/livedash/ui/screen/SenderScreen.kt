@@ -6,6 +6,7 @@ import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -83,16 +84,26 @@ fun SenderScreen(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
-            ctx.startForegroundService(
-                Intent(ctx, OverlayService::class.java).apply {
-                    action = OverlayService.ACTION_START
-                    putExtra(OverlayService.EXTRA_RESULT_CODE, result.resultCode)
-                    putExtra(OverlayService.EXTRA_DATA, result.data)
-                    putExtra(OverlayService.EXTRA_SERVER_IP, serverIp)
-                    putExtra(OverlayService.EXTRA_SERVER_PORT, port.toIntOrNull() ?: 8765)
-                    putExtra(OverlayService.EXTRA_SENDER_NAME, senderName)
-                }
-            )
+            try {
+                ctx.startForegroundService(
+                    Intent(ctx, OverlayService::class.java).apply {
+                        action = OverlayService.ACTION_START
+                        putExtra(OverlayService.EXTRA_RESULT_CODE, result.resultCode)
+                        putExtra(OverlayService.EXTRA_DATA, result.data)
+                        putExtra(OverlayService.EXTRA_SERVER_IP, serverIp)
+                        putExtra(OverlayService.EXTRA_SERVER_PORT, port.toIntOrNull() ?: 8765)
+                        putExtra(OverlayService.EXTRA_SENDER_NAME, senderName)
+                    }
+                )
+            } catch (e: Exception) {
+                Toast.makeText(ctx, "Failed to start overlay: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        } else {
+            Toast.makeText(
+                ctx,
+                "Screen capture permission denied — overlay not started",
+                Toast.LENGTH_LONG
+            ).show()
         }
     }
 
